@@ -135,11 +135,13 @@ def wait_for(predicate, timeout: float = 15.0, interval: float = 0.05):
 
 
 class GatewayProtocolTests(unittest.TestCase):
+    wait_timeout = 3
+
     def setUp(self):
         self.workspace = tempfile.mkdtemp(prefix="a2a-gw-")
         self.other = tempfile.mkdtemp(prefix="a2a-other-")
         self.server = gateway_mod.Gateway(
-            0, gateway_mod.RelayQueue(600, 3, self.workspace),
+            0, gateway_mod.RelayQueue(600, self.wait_timeout, self.workspace),
             RELAY_TOKEN, SESSION_TOKEN, self.workspace, 0,
         )
         self.port = self.server.server_port
@@ -157,6 +159,29 @@ class GatewayProtocolTests(unittest.TestCase):
         return http_json(self.port, "/", method="POST", bearer=bearer, body={
             "jsonrpc": "2.0", "id": request_id, "method": method, "params": params,
         })
+
+    def stream_rpc(self, method: str, params: dict, *, request_id: str):
+        body = json.dumps({"jsonrpc": "2.0", "id": request_id, "method": method, "params": params})
+        headers = {"Authorization": f"Bearer {SESSION_TOKEN}",
+                   "Content-Type": "application/json", "Accept": "text/event-stream"}
+        connection = http.client.HTTPConnection("127.0.0.1", self.port, timeout=10)
+        self.addCleanup(connection.close)
+        connection.request("POST", "/", body, headers)
+        response = connection.getresponse()
+        self.addCleanup(response.close)
+        self.assertEqual(response.status, 200)
+        self.assertEqual(response.headers.get_content_type(), "text/event-stream")
+
+        data = []
+        for line in response:
+            if line.startswith(b"data:"):
+                data.append(line.removeprefix(b"data:").strip())
+            elif not line.strip() and data:
+                event = json.loads(b"\n".join(data))
+                self.assertEqual(event["jsonrpc"], "2.0")
+                self.assertEqual(event["id"], request_id)
+                yield event["result"]
+                data.clear()
 
     def test_card_session_auth_queue_and_lease(self):
         status, card = http_json(self.port, "/.well-known/agent-card.json")
@@ -209,6 +234,85 @@ class GatewayProtocolTests(unittest.TestCase):
         status, _ = http_json(self.port, "/_admin/stop", method="POST", body={}, bearer=RELAY_TOKEN)
         self.assertEqual(status, 200)
         wait_for(lambda: not self.thread.is_alive(), timeout=5)
+
+    def test_message_stream_delivers_reply_after_blocking_send_timeout(self):
+        status, card = http_json(self.port, "/.well-known/agent-card.json")
+        self.assertEqual(status, 200)
+        self.assertIs(card["capabilities"]["streaming"], True)
+
+        started = time.monotonic()
+        events = self.stream_rpc("message/stream", {"message": {
+            "kind": "message", "messageId": str(uuid.uuid4()), "role": "user",
+            "parts": [{"kind": "text", "text": "hello"}],
+        }}, request_id="long-desktop-task")
+        task = next(events)
+        self.assertEqual(task["kind"], "task")
+        self.assertEqual(task["status"]["state"], "submitted")
+
+        status, claim = http_json(self.port, "/_relay/claim", method="POST", bearer=RELAY_TOKEN,
+                                  body={"workspace": self.workspace})
+        self.assertEqual(status, 200)
+        self.assertEqual(claim["taskId"], task["id"])
+        time.sleep(max(0.0, started + self.wait_timeout + 0.25 - time.monotonic()))
+        status, _ = http_json(self.port, "/_relay/complete", method="POST", bearer=RELAY_TOKEN, body={
+            "taskId": task["id"], "leaseId": claim["leaseId"], "text": "exact delayed reply",
+        })
+        self.assertEqual(status, 200)
+
+        updates = list(events)
+        artifacts = [event for event in updates if event["kind"] == "artifact-update"]
+        self.assertEqual(len(artifacts), 1)
+        self.assertEqual(artifacts[0]["taskId"], task["id"])
+        self.assertEqual(artifacts[0]["contextId"], task["contextId"])
+        self.assertEqual(artifacts[0]["artifact"]["parts"][0]["text"], "exact delayed reply")
+        self.assertEqual(updates[-1]["kind"], "status-update")
+        self.assertEqual(updates[-1]["taskId"], task["id"])
+        self.assertEqual(updates[-1]["status"]["state"], "completed")
+        self.assertIs(updates[-1]["final"], True)
+
+    def test_tasks_resubscribe_receives_result_for_existing_task(self):
+        status, payload = self.rpc("message/send", {
+            "message": {
+                "kind": "message", "messageId": str(uuid.uuid4()), "role": "user",
+                "parts": [{"kind": "text", "text": "hello"}],
+            },
+            "configuration": {"blocking": False},
+        })
+        self.assertEqual(status, 200)
+        task = payload["result"]
+        events = self.stream_rpc("tasks/resubscribe", {"id": task["id"]}, request_id="reconnect")
+        self.assertEqual(next(events), task)
+
+        status, claim = http_json(self.port, "/_relay/claim", method="POST", bearer=RELAY_TOKEN,
+                                  body={"workspace": self.workspace})
+        self.assertEqual(status, 200)
+        self.assertEqual(claim["taskId"], task["id"])
+        status, _ = http_json(self.port, "/_relay/complete", method="POST", bearer=RELAY_TOKEN, body={
+            "taskId": task["id"], "leaseId": claim["leaseId"], "text": "reply after reconnect",
+        })
+        self.assertEqual(status, 200)
+        updates = list(events)
+        self.assertEqual(updates[-2]["artifact"]["parts"][0]["text"], "reply after reconnect")
+        self.assertIs(updates[-1]["final"], True)
+
+    def test_new_message_reuses_known_context_without_reusing_task(self):
+        def submit(text, **reference):
+            status, payload = self.rpc("message/send", {
+                "message": {
+                    "kind": "message", "messageId": str(uuid.uuid4()), "role": "user",
+                    "parts": [{"kind": "text", "text": text}], **reference,
+                },
+                "configuration": {"blocking": False},
+            })
+            self.assertEqual(status, 200)
+            self.assertIn("result", payload, payload)
+            return payload["result"]
+
+        original = submit("first task")
+        continuation = submit("second task", contextId=original["contextId"])
+        self.assertNotEqual(continuation["id"], original["id"])
+        self.assertEqual(continuation["contextId"], original["contextId"])
+        self.assertEqual(continuation["status"]["state"], "submitted")
 
 
 class CliLifecycleTests(unittest.TestCase):

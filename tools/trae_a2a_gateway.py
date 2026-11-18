@@ -172,13 +172,16 @@ class RelayQueue:
         working = sum(task.state == "working" for task in self.tasks.values())
         return queued, working
 
-    def message(self, params: dict) -> dict:
+    def submit(self, params: dict) -> tuple[Task, bool]:
         message = object_value(params.get("message"))
         message_id = text_value(message.get("messageId"), "messageId", 128)
         if message.get("role") != "user" or message.get("kind", "message") != "message":
             raise RequestError(-32602, "Expected a user message")
-        if message.get("taskId") or message.get("contextId"):
+        if message.get("taskId"):
             raise RequestError(-32004, "The desktop relay accepts standalone tasks")
+        context_id = message.get("contextId")
+        if context_id is not None:
+            context_id = text_value(context_id, "contextId", 128)
         parts = message.get("parts")
         if not isinstance(parts, list) or not parts:
             raise RequestError(-32602, "Expected one or more message parts")
@@ -198,14 +201,22 @@ class RelayQueue:
             self.expire()
             task = next((item for item in self.tasks.values() if item.message_id == message_id), None)
             if task is None:
+                if context_id and not any(item.context_id == context_id for item in self.tasks.values()):
+                    raise RequestError(-32602, "Unknown contextId for the active workspace")
                 active_count = sum(item.terminal_at is None for item in self.tasks.values())
                 if len(self.tasks) >= MAX_TASKS or active_count >= MAX_ACTIVE_TASKS:
                     raise RequestError(-32000, "The desktop relay queue is full")
-                task = Task(message_id, prompt, monotonic() + self.task_timeout)
+                task = Task(message_id, prompt, monotonic() + self.task_timeout,
+                            context_id=context_id or str(uuid4()))
                 self.tasks[task.id] = task
-            elif task.prompt != prompt:
-                raise RequestError(-32602, "messageId already belongs to a different prompt")
+            elif task.prompt != prompt or (context_id and task.context_id != context_id):
+                raise RequestError(-32602, "messageId already belongs to a different message")
 
+            return task, blocking
+
+    def message(self, params: dict) -> dict:
+        task, blocking = self.submit(params)
+        with self.changed:
             wait_until = min(task.deadline, monotonic() + self.wait_timeout)
             while blocking and task.terminal_at is None and monotonic() < wait_until:
                 self.changed.wait(max(0, wait_until - monotonic()))
@@ -247,6 +258,7 @@ class RelayQueue:
                 return {}
             task.lease_id = str(uuid4())
             task.update("working")
+            self.changed.notify_all()
             return {"taskId": task.id, "leaseId": task.lease_id, "text": task.prompt,
                     "workspace": self.workspace}
 
@@ -375,7 +387,7 @@ def agent_card(url: str) -> dict:
         "url": url,
         "preferredTransport": "JSONRPC",
         "version": "1.0.0",
-        "capabilities": {"streaming": False, "pushNotifications": False},
+        "capabilities": {"streaming": True, "pushNotifications": False},
         "defaultInputModes": ["text/plain"],
         "defaultOutputModes": ["text/plain"],
         "skills": [{
@@ -469,6 +481,16 @@ class Handler(BaseHTTPRequestHandler):
             if type(request_id) not in {str, int} or not isinstance(method, str):
                 request_id = None
                 raise RequestError(-32600, "A request id and method are required")
+            params = object_value(request.get("params", {}))
+            if method == "message/stream":
+                task, _ = self.server.queue.submit(params)
+                self.stream_task(request_id, task)
+                return
+            if method == "tasks/resubscribe":
+                with self.server.queue.changed:
+                    task = self.server.queue.get_task(params.get("id"))
+                self.stream_task(request_id, task)
+                return
             operations = {
                 "message/send": self.server.queue.message,
                 "tasks/get": self.server.queue.get,
@@ -476,13 +498,57 @@ class Handler(BaseHTTPRequestHandler):
             }
             if method not in operations:
                 raise RequestError(-32601, "Method not found")
-            result = operations[method](object_value(request.get("params", {})))
+            result = operations[method](params)
             self.reply(200, {"jsonrpc": "2.0", "id": request_id, "result": result})
         except RequestError as exc:
             self.reply(200, {
                 "jsonrpc": "2.0", "id": request_id,
                 "error": {"code": exc.code, "message": str(exc)},
             })
+
+    def stream_task(self, request_id: str | int, task: Task) -> None:
+        queue = self.server.queue
+
+        def event(result: dict) -> None:
+            frame = json.dumps({"jsonrpc": "2.0", "id": request_id, "result": result})
+            self.wfile.write(f"data: {frame}\n\n".encode())
+            self.wfile.flush()
+
+        try:
+            self.send_response(200)
+            self.send_header("Content-Type", "text/event-stream")
+            self.send_header("Cache-Control", "no-store")
+            self.send_header("Connection", "close")
+            self.end_headers()
+            self.close_connection = True
+
+            with queue.changed:
+                snapshot = task.snapshot()
+            identity = {"taskId": task.id, "contextId": task.context_id}
+            event({key: snapshot[key] for key in ("kind", "id", "contextId", "status")})
+            last_state = snapshot["status"]["state"]
+            while True:
+                with queue.changed:
+                    queue.expire()
+                    if task.terminal_at is None and task.state == last_state:
+                        queue.changed.wait(min(5, max(0, task.deadline - monotonic())))
+                        queue.expire()
+                    snapshot = task.snapshot()
+                    final = task.terminal_at is not None
+                status = snapshot["status"]
+                for artifact in snapshot.get("artifacts", []):
+                    event({"kind": "artifact-update", **identity, "artifact": artifact,
+                           "append": False, "lastChunk": True})
+                if final or status["state"] != last_state:
+                    event({"kind": "status-update", **identity, "status": status, "final": final})
+                    if final:
+                        return
+                    last_state = status["state"]
+                else:
+                    self.wfile.write(b": waiting\n\n")
+                    self.wfile.flush()
+        except (BrokenPipeError, ConnectionResetError, TimeoutError):
+            pass
 
     def handle_relay(self) -> None:
         if not self.authorized(self.server.relay_auth):
