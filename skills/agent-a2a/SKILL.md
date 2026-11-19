@@ -5,10 +5,13 @@ description: Use the installed local A2A bridge to send work from Orca or Codex 
 
 <!-- Installed by trae-gemini-a2a. -->
 
-# Local A2A bridge
+# Local A2A bridge (v2.1)
 
 Use `a2a.cmd` from the project directory. In an already-running Orca process, use `& (Join-Path $env:LOCALAPPDATA 'AgentA2A\bin\a2a.cmd')` if the command is absent from PATH. For a custom installation, use its configured absolute launcher path.
 
 - Run `a2a.cmd use` from the current project's root when assigning work that depends on that project. `a2a.cmd use --workspace <path>` explicitly selects the project. `a2a.cmd status` reports the active workspace and endpoint availability.
-- Use `a2a.cmd send --to gemini --text "<task>"` or `a2a.cmd send --to trae --text "<task>"`. Include the scope, allowed operations, and expected output in the task. Report the returned task ID and actual state.
+- Dispatch to TRAE once: `a2a.cmd send --to trae --text "<task card>"`. It returns `{task_id, state}` immediately. Keep the `task_id`; do not re-dispatch the same task.
+- Wait once for the terminal notification: `a2a.cmd wait --task-id <task_id> --timeout 620`. The local bridge tracks state, retries and the lease; do not run `a2a.cmd status`, `tasks/get`, or another `send` while waiting.
+- The wait returns one card: `task_id`, `status` (`success` | `partial` | `timeout` | `failed`), `summary`, `card_path`, `event_id`, and `text`. Read the result card at `card_path` and accept the work once. Deduplicate by `event_id`: if that event was already accepted, do nothing.
+- `a2a.cmd send --to gemini --text "<task>"` keeps the synchronous Gemini reply. `a2a.cmd send --to trae --text "<task>" --wait` preserves the legacy blocking behavior.
 - For Gemini CLI's native TRAE subagent, start `a2a.cmd gemini` in the project and invoke `trae-bridge`. For an inbound TRAE task, use `/trae-gemini-bridge` in the TRAE window for the selected project so it can claim and return the result.

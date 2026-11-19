@@ -6,7 +6,7 @@ user-invocable: true
 
 <!-- Installed by trae-gemini-a2a. -->
 
-# TRAE 与 Gemini 通过 A2A 协作
+# TRAE 与 Gemini 通过 A2A 协作（v2.1）
 
 使用用户级 `agent-a2a-bridge` MCP 提供的工具。
 
@@ -19,5 +19,9 @@ user-invocable: true
 ## 领取给 TRAE 的任务
 
 1. 调用 `claim_trae_task`，传入当前 `workspace` 和所需的 `wait_seconds`，每次最多等待 25 秒。没有任务时可再查两次。
-2. 保留返回的 `taskId`、`leaseId`。在当前工作区及用户授权范围内执行任务。
-3. 用 `complete_trae_task` 提交原始任务 ID、租约 ID 和实际结果。执行失败时设为 `failed: true` 并提交具体原因。
+2. 保留返回的 `taskId`、`leaseId`。按 `leaseBudgetSeconds`（默认 420 秒）安排执行：在预算内回传，不要拖到网关硬超时。
+3. 用 `complete_trae_task` 提交原始任务 ID、租约 ID、结果卡文本和 `status`：
+   - `done`：全部完成；
+   - `partial`：预算内只完成一部分，剩余项写在结果卡 `remaining` 字段；
+   - `failed`：无法执行，写明具体原因。
+4. 完成后由网关生成唯一终态结果卡（`%LOCALAPPDATA%\AgentA2A\results\<taskId>.json`），等待方只收到一条可去重的终态通知，不需要 TRAE 侧轮询。

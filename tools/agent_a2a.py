@@ -281,10 +281,20 @@ def _spawn_gateway(workspace: str, session: str) -> subprocess.Popen:
     flags = 0
     if os.name == "nt":
         flags = subprocess.DETACHED_PROCESS | subprocess.CREATE_NEW_PROCESS_GROUP
+    command = [sys.executable, "-B", str(script), "--workspace", workspace,
+               "--port", str(receiver_port()), "--gemini-port", str(gemini_port())]
+    for name, option in (("AGENT_A2A_TASK_TIMEOUT", "--task-timeout"),
+                         ("AGENT_A2A_LEASE_BUDGET", "--lease-budget")):
+        raw = os.environ.get(name, "").strip()
+        if raw:
+            try:
+                value = int(raw)
+            except ValueError as error:
+                raise BridgeError(f"{name} 不是有效整数。") from error
+            command += [option, str(value)]
     with open(log_path, "ab", buffering=0) as log:
         return subprocess.Popen(
-            [sys.executable, "-B", str(script), "--workspace", workspace,
-             "--port", str(receiver_port()), "--gemini-port", str(gemini_port())],
+            command,
             cwd=workspace, env=environment, stdin=subprocess.DEVNULL,
             stdout=log, stderr=subprocess.STDOUT, creationflags=flags, close_fds=True,
         )
@@ -565,12 +575,13 @@ def gemini_task_reply(task_id: str | None, state: str | None, text: str, tool_st
     return {"task_id": task_id, "state": state, "text": text}
 
 
-def stream_events(endpoint: tuple[str, int, str], params: dict, deadline: float, *, bearer: str | None = None):
+def stream_events(endpoint: tuple[str, int, str], params: dict, deadline: float, *, bearer: str | None = None,
+                  method: str = "message/stream"):
     remaining = deadline - time.monotonic()
     if remaining <= 0:
         raise BridgeError("A2A 任务超时。")
     request_id = str(uuid.uuid4())
-    request = {"jsonrpc": "2.0", "id": request_id, "method": "message/stream", "params": params}
+    request = {"jsonrpc": "2.0", "id": request_id, "method": method, "params": params}
     with http_response(endpoint, body=request, timeout=remaining, bearer=bearer,
                        accept="text/event-stream") as response:
         if response.getheader("Content-Type", "").lower().split(";", 1)[0] != "text/event-stream":
@@ -672,6 +683,98 @@ def send_to_gemini(text: str, timeout_seconds: int, *, url: str | None = None,
     return gemini_task_reply(task_id, state, reply_text(result), tool_states)
 
 
+def _trae_endpoint(health: dict, timeout_seconds: float) -> tuple[tuple[str, int, str], str]:
+    port = health.get("port")
+    session = health.get("sessionToken")
+    if not isinstance(port, int) or not isinstance(session, str) or not session:
+        raise BridgeError("活动服务未提供可用的 A2A 会话凭证。")
+    base = f"http://{LOOPBACK}:{port}/"
+    _, endpoint = _agent_endpoint(base, timeout_seconds, bearer=session, label="TRAE")
+    return endpoint, session
+
+
+def dispatch_to_trae(text: str, health: dict, *, attempts: int = 2) -> dict:
+    """立即派单并返回 taskId；状态跟踪由本机网关承担，不在客户端轮询。"""
+    deadline = time.monotonic() + 10
+    endpoint, session = _trae_endpoint(health, 10)
+    params = {
+        "message": {"kind": "message", "messageId": str(uuid.uuid4()), "role": "user",
+                    "parts": [{"kind": "text", "text": text}]},
+        "configuration": {"blocking": False, "acceptedOutputModes": ["text/plain"], "historyLength": 0},
+    }
+    for attempt in range(max(1, attempts)):
+        try:
+            result = rpc(endpoint, "message/send", params, deadline, bearer=session)
+            break
+        except (ConnectionError, socket.timeout, TimeoutError, http.client.HTTPException) as exc:
+            if attempt + 1 >= attempts:
+                raise BridgeError(f"派单失败：{exc}") from exc
+            time.sleep(0.25 * (attempt + 1))
+    task_id = result.get("id")
+    if not isinstance(task_id, str) or not task_id:
+        raise BridgeError("TRAE 返回了没有 ID 的任务。")
+    return {"task_id": task_id, "state": result.get("status", {}).get("state", "submitted")}
+
+
+def terminal_card(task_id: str, event: dict, text: str) -> dict:
+    status = event.get("status", {})
+    metadata = event.get("metadata") if isinstance(event.get("metadata"), dict) else {}
+    state = status.get("state")
+    outcome = metadata.get("outcome") or ("success" if state == "completed" else "failed")
+    summary = metadata.get("summary")
+    if not summary:
+        summary = next((line.strip() for line in text.splitlines() if line.strip()), "")
+    return {
+        "task_id": task_id,
+        "status": outcome,
+        "state": state,
+        "summary": (summary or "")[:160],
+        "card_path": metadata.get("cardPath"),
+        "event_id": metadata.get("eventId") or f"{task_id}:{outcome}",
+        "text": text,
+    }
+
+
+def wait_for_trae_task(task_id: str, timeout_seconds: int, health: dict) -> dict:
+    """在本机等待唯一一条终态通知；断线用 tasks/resubscribe 重连，不查询状态。"""
+    deadline = time.monotonic() + timeout_seconds
+    endpoint, session = _trae_endpoint(health, timeout_seconds)
+    reconnects = 0
+    text_chunks: list[str] = []
+    while True:
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            raise BridgeError(f"等待 TRAE 任务 {task_id} 终态超时。")
+        try:
+            with closing(stream_events(endpoint, {"id": task_id}, deadline, bearer=session,
+                                       method="tasks/resubscribe")) as events:
+                final = None
+                snapshot = None
+                for event in events:
+                    kind = event.get("kind")
+                    if kind == "artifact-update":
+                        chunk = parts_text(event.get("artifact", {}))
+                        if chunk:
+                            text_chunks.append(chunk)
+                    elif kind == "status-update":
+                        if event.get("final"):
+                            final = event
+                            break
+                    elif kind == "task":
+                        snapshot = event
+                if final is not None:
+                    return terminal_card(task_id, final, "".join(text_chunks))
+                if snapshot is not None and snapshot.get("status", {}).get("state") in {
+                        "completed", "failed", "canceled"}:
+                    return terminal_card(task_id, snapshot, "".join(text_chunks))
+        except (ConnectionError, socket.timeout, TimeoutError, http.client.HTTPException):
+            pass
+        reconnects += 1
+        if reconnects > 32:
+            raise BridgeError(f"等待 TRAE 任务 {task_id} 终态时连续断线。")
+        time.sleep(min(1.0, 0.2 * reconnects))
+
+
 def send_to_trae(text: str, timeout_seconds: int, health: dict) -> dict:
     port = health.get("port")
     session = health.get("sessionToken")
@@ -728,10 +831,12 @@ def claim_trae_task(wait_seconds: int, token: str, *, workspace: str | None = No
 
 
 def complete_trae_task(task_id: str, lease_id: str, text: str, failed: bool, *, token: str,
-                       url: str | None = None, port: int | None = None) -> dict:
+                       status: str = "done", url: str | None = None, port: int | None = None) -> dict:
+    if status not in {"done", "partial", "failed"}:
+        raise BridgeError("status 必须是 done、partial 或 failed。")
     return relay_request(
         "/_relay/fail" if failed else "/_relay/complete",
-        {"taskId": task_id, "leaseId": lease_id, "text": text},
+        {"taskId": task_id, "leaseId": lease_id, "text": text, "status": status},
         token, url=url, port=port,
     )
 
@@ -779,6 +884,11 @@ def build_parser() -> argparse.ArgumentParser:
     send.add_argument("--to", required=True, choices=("gemini", "trae"))
     send.add_argument("--text", required=True)
     send.add_argument("--timeout", type=int, default=110)
+    send.add_argument("--wait", action="store_true",
+                      help="向 TRAE 派单后阻塞到终态（兼容旧行为）；默认立即返回 taskId。")
+    wait = subparsers.add_parser("wait", help="等待 TRAE 任务的一条终态通知（不查询状态）。")
+    wait.add_argument("--task-id", required=True)
+    wait.add_argument("--timeout", type=int, default=620)
     subparsers.add_parser("gemini", help="用当前工作区启动原生 Gemini CLI。", add_help=False)
     return parser
 
@@ -811,16 +921,26 @@ def main(argv: list[str] | None = None) -> int:
         if options.command == "stop":
             print(_readable({"stopped": stop_service()}))
             return 0
+        if options.command == "wait":
+            if not 1 <= options.timeout <= 900:
+                raise BridgeError("timeout 必须在 1 到 900 秒之间。")
+            health = require_active(canonical_workspace(os.getcwd()))
+            card = wait_for_trae_task(options.task_id.strip(), options.timeout, health)
+            print(_readable({"to": "trae", **card}))
+            return 0
         text = options.text
         if not text.strip() or len(text) > MAX_TEXT_LENGTH:
             raise BridgeError(f"text 必须是非空文本且不超过 {MAX_TEXT_LENGTH} 字符。")
-        if not 1 <= options.timeout <= 600:
-            raise BridgeError("timeout 必须在 1 到 600 秒之间。")
+        if not 1 <= options.timeout <= 900:
+            raise BridgeError("timeout 必须在 1 到 900 秒之间。")
         if options.to == "gemini":
             result = send_to_gemini_for_workspace(
                 canonical_workspace(os.getcwd()), text, options.timeout, allow_start=False)
         else:
             health = require_active(canonical_workspace(os.getcwd()))
+            if not options.wait:
+                print(_readable({"to": "trae", **dispatch_to_trae(text, health)}))
+                return 0
             result = send_to_trae(text, options.timeout, health)
         print(_readable({"to": options.to, **result}))
         return 0

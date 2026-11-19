@@ -5,7 +5,8 @@
 ## 功能特性
 
 - **双向派单**：从 Orca / Gemini CLI 向 TRAE 桌面派发任务，也可以从 TRAE 调用 Gemini 远程子代理。
-- **TRAE 领取待办**：TRAE 通过 `/trae-gemini-bridge` Skill 领取任务、执行并回传结果，支持任务租约与超时。
+- **V2.1 异步终态通知**：向 TRAE 派单立即返回 `task_id`；`a2a wait` 在本机等待一条可去重的终态通知（`success` / `partial` / `timeout` / `failed`，含短摘要与结果卡路径），等待期间不轮询状态、不产生模型轮次。
+- **TRAE 领取待办**：TRAE 通过 `/trae-gemini-bridge` Skill 领取任务、执行并回传结果，支持任务租约、420 秒执行预算与 `partial` 部分回传。
 - **本机安全**：桥接服务只绑定回环地址，随机生成本机令牌鉴权，任务文本不写入日志。
 - **按项目切换**：`a2a use` 将活动工作区绑定到当前项目，切换项目自动失效旧凭证。
 - **零侵入安装**：安装器统一挂载 TRAE 用户级 MCP 与 Skill、Gemini 远程子代理和 Orca / Codex Skill，不修改各项目代码。
@@ -43,8 +44,11 @@ a2a use
 a2a status
 a2a send --to gemini --text '计算 3278 + 2865，只返回数字'
 a2a send --to trae --text '读取当前项目 README.md 的第一行，原样返回'
+a2a wait --task-id <上一步返回的 task_id> --timeout 620
 a2a gemini
 ```
+
+向 TRAE 派单默认只返回 `task_id`，随后用一次 `a2a wait` 收到终态通知；不要再轮询 `status` 或重复 `send`。需要旧的一步式阻塞行为时加 `--wait`。
 
 ```powershell
 & "$env:LOCALAPPDATA\AgentA2A\bin\a2a.cmd" use
@@ -59,6 +63,20 @@ a2a gemini
 3. 在 TRAE 领取并执行任务。结果以 A2A 任务状态和结果文本回到发送方。
 
 一台本机桥接服务同时绑定一个活动工作区。切换项目会启动针对新目录的官方 Gemini 服务。TRAE 领取时校验工作区，旧 Gemini 会话的凭证在切换后失效。TRAE 由桌面会话主动领取，队列只保存在本机进程内。 Gemini CLI 会通过 A2A 流等待桌面回执，单个待办有效期为 10 分钟。如果长时间闲置的 Gemini 会话提示上下文已过期，重新运行 `a2a gemini` 可建立新会话。
+
+## V2.1 异步派单与终态通知
+
+1. **派单即返回**：`a2a send --to trae` 只提交任务并返回 `{task_id, state}`，不再阻塞等待桌面执行。
+2. **本地等待**：`a2a wait --task-id <id>` 通过 A2A `tasks/resubscribe` 等待终态；断线自动重连，状态跟踪、重试、超时与租约全部由本机网关承担。等待期间调用方不查询状态、不重复派单、不产生模型轮次。
+3. **单条终态通知**：终态事件携带 `event_id`、`status`、`summary` 和 `card_path`。结果卡落在 `%LOCALAPPDATA%\AgentA2A\results\<taskId>.json`，同一任务重复订阅返回同一个 `event_id`，调用方按 `event_id` 去重即可避免重复唤醒。
+4. **终态语义**：
+   - `success`：TRAE 在租约内正常回传；
+   - `partial`：TRAE 明确以 partial 回传，或领取后超过 420 秒执行预算未回传，由网关按部分完成收口；
+   - `timeout`：任务在硬截止时间前无人领取；
+   - `failed`：TRAE 明确失败或取消。
+5. **调试日志**：只写本机 `%LOCALAPPDATA%\AgentA2A\gateway.log`，不记录任务正文与令牌。
+
+可通过 `AGENT_A2A_TASK_TIMEOUT` 和 `AGENT_A2A_LEASE_BUDGET` 调整硬截止时间与执行预算（默认 600 / 420 秒），测试或演示时可缩短。
 
 ## 常见问题
 

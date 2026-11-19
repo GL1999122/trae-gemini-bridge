@@ -35,6 +35,7 @@ COMPLETE_TOOL = {
             "lease_id": {"type": "string", "minLength": 1, "maxLength": 128},
             "text": TEXT_SCHEMA,
             "failed": {"type": "boolean"},
+            "status": {"type": "string", "enum": ["done", "partial", "failed"]},
         },
         "required": ["task_id", "lease_id", "text"],
         "additionalProperties": False,
@@ -152,9 +153,12 @@ def call_tool(params: dict, token: str, managed: bool) -> dict:
         failed = arguments.get("failed", False)
         if not isinstance(failed, bool):
             raise core.BridgeError("failed 必须是布尔值。")
+        status = arguments.get("status", "failed" if failed else "done")
+        if status not in {"done", "partial", "failed"}:
+            raise core.BridgeError("status 必须是 done、partial 或 failed。")
         return core.complete_trae_task(
             get_text(arguments, "task_id", 128), get_text(arguments, "lease_id", 128),
-            get_text(arguments, "text"), failed, token=token)
+            get_text(arguments, "text"), failed, token=token, status=status)
     raise core.BridgeError("未知或未启用的工具。")
 
 
@@ -171,7 +175,7 @@ def handle(message: object, token: str, managed: bool, token_error: str = "") ->
         response["result"] = {
             "protocolVersion": requested if requested in MCP_VERSIONS else MCP_VERSIONS[0],
             "capabilities": {"tools": {}},
-            "serverInfo": {"name": "trae-gemini-a2a", "version": "1.0.0"},
+            "serverInfo": {"name": "trae-gemini-a2a", "version": "2.1.0"},
         }
     elif method == "ping":
         response["result"] = {}

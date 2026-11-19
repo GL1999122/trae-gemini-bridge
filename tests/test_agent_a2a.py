@@ -140,8 +140,10 @@ class GatewayProtocolTests(unittest.TestCase):
     def setUp(self):
         self.workspace = tempfile.mkdtemp(prefix="a2a-gw-")
         self.other = tempfile.mkdtemp(prefix="a2a-other-")
+        self.results = Path(tempfile.mkdtemp(prefix="a2a-results-"))
         self.server = gateway_mod.Gateway(
-            0, gateway_mod.RelayQueue(600, self.wait_timeout, self.workspace),
+            0, gateway_mod.RelayQueue(600, self.wait_timeout, self.workspace,
+                                      results_dir=self.results),
             RELAY_TOKEN, SESSION_TOKEN, self.workspace, 0,
         )
         self.port = self.server.server_port
@@ -149,6 +151,7 @@ class GatewayProtocolTests(unittest.TestCase):
         self.thread.start()
         self.addCleanup(shutil.rmtree, self.workspace, True)
         self.addCleanup(shutil.rmtree, self.other, True)
+        self.addCleanup(shutil.rmtree, self.results, True)
 
     def tearDown(self):
         self.server.shutdown()
@@ -314,6 +317,117 @@ class GatewayProtocolTests(unittest.TestCase):
         self.assertEqual(continuation["contextId"], original["contextId"])
         self.assertEqual(continuation["status"]["state"], "submitted")
 
+    def submit_task(self, text: str = "terminal card task") -> str:
+        status, payload = self.rpc("message/send", {
+            "message": {
+                "kind": "message", "messageId": str(uuid.uuid4()), "role": "user",
+                "parts": [{"kind": "text", "text": text}],
+            },
+            "configuration": {"blocking": False},
+        })
+        self.assertEqual(status, 200)
+        return payload["result"]["id"]
+
+    def test_partial_completion_emits_one_deduplicated_terminal_card(self):
+        task_id = self.submit_task()
+        status, claim = http_json(self.port, "/_relay/claim", method="POST",
+                                  bearer=RELAY_TOKEN, body={"workspace": self.workspace})
+        self.assertEqual(status, 200)
+        self.assertEqual(claim["leaseBudgetSeconds"], gateway_mod.DEFAULT_LEASE_BUDGET)
+        status, _ = http_json(self.port, "/_relay/complete", method="POST", bearer=RELAY_TOKEN, body={
+            "taskId": task_id, "leaseId": claim["leaseId"], "text": "半成品结果", "status": "partial",
+        })
+        self.assertEqual(status, 200)
+
+        status, task = self.rpc("tasks/get", {"id": task_id})
+        self.assertEqual(status, 200)
+        result = task["result"]
+        self.assertEqual(result["status"]["state"], "completed")
+        self.assertEqual(result["metadata"]["outcome"], "partial")
+        self.assertTrue(result["metadata"]["eventId"].startswith(task_id + ":partial:"))
+        card = Path(result["metadata"]["cardPath"])
+        self.assertTrue(card.is_file())
+        self.assertEqual(json.loads(card.read_text(encoding="utf-8"))["status"], "partial")
+
+        first = list(self.stream_rpc("tasks/resubscribe", {"id": task_id}, request_id="first"))
+        second = list(self.stream_rpc("tasks/resubscribe", {"id": task_id}, request_id="second"))
+        self.assertEqual(first[-1]["metadata"]["eventId"], second[-1]["metadata"]["eventId"])
+        self.assertIs(first[-1]["final"], True)
+
+        status, _ = http_json(self.port, "/_relay/complete", method="POST", bearer=RELAY_TOKEN, body={
+            "taskId": task_id, "leaseId": claim["leaseId"], "text": "半成品结果", "status": "partial",
+        })
+        self.assertEqual(status, 200)
+
+    def test_lease_budget_closes_a_claimed_task_as_partial(self):
+        results = Path(tempfile.mkdtemp(prefix="a2a-lease-"))
+        self.addCleanup(shutil.rmtree, results, True)
+        server = gateway_mod.Gateway(
+            0, gateway_mod.RelayQueue(30, 1, self.workspace, lease_budget=1, results_dir=results),
+            RELAY_TOKEN, SESSION_TOKEN, self.workspace, 0,
+        )
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        self.addCleanup(server.server_close)
+        self.addCleanup(server.shutdown)
+        port = server.server_port
+        status, payload = http_json(port, "/", method="POST", bearer=SESSION_TOKEN, body={
+            "jsonrpc": "2.0", "id": "queue", "method": "message/send",
+            "params": {
+                "message": {"kind": "message", "messageId": str(uuid.uuid4()), "role": "user",
+                            "parts": [{"kind": "text", "text": "lease task"}]},
+                "configuration": {"blocking": False},
+            },
+        })
+        self.assertEqual(status, 200)
+        task_id = payload["result"]["id"]
+        status, claim = http_json(port, "/_relay/claim", method="POST",
+                                  bearer=RELAY_TOKEN, body={"workspace": self.workspace})
+        self.assertEqual(status, 200)
+        time.sleep(1.2)
+        status, task = http_json(port, "/", method="POST", bearer=SESSION_TOKEN, body={
+            "jsonrpc": "2.0", "id": "get", "method": "tasks/get", "params": {"id": task_id},
+        })
+        self.assertEqual(status, 200)
+        self.assertEqual(task["result"]["metadata"]["outcome"], "partial")
+        status, _ = http_json(port, "/_relay/complete", method="POST", bearer=RELAY_TOKEN, body={
+            "taskId": task_id, "leaseId": claim["leaseId"], "text": "too late",
+        })
+        self.assertEqual(status, 400)
+
+    def test_deadline_closes_an_unclaimed_task_as_timeout(self):
+        results = Path(tempfile.mkdtemp(prefix="a2a-timeout-"))
+        self.addCleanup(shutil.rmtree, results, True)
+        server = gateway_mod.Gateway(
+            0, gateway_mod.RelayQueue(1, 1, self.workspace, lease_budget=1, results_dir=results),
+            RELAY_TOKEN, SESSION_TOKEN, self.workspace, 0,
+        )
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        self.addCleanup(server.server_close)
+        self.addCleanup(server.shutdown)
+        port = server.server_port
+        status, payload = http_json(port, "/", method="POST", bearer=SESSION_TOKEN, body={
+            "jsonrpc": "2.0", "id": "queue", "method": "message/send",
+            "params": {
+                "message": {"kind": "message", "messageId": str(uuid.uuid4()), "role": "user",
+                            "parts": [{"kind": "text", "text": "timeout task"}]},
+                "configuration": {"blocking": False},
+            },
+        })
+        self.assertEqual(status, 200)
+        task_id = payload["result"]["id"]
+        time.sleep(1.2)
+        status, task = http_json(port, "/", method="POST", bearer=SESSION_TOKEN, body={
+            "jsonrpc": "2.0", "id": "get", "method": "tasks/get", "params": {"id": task_id},
+        })
+        self.assertEqual(status, 200)
+        self.assertEqual(task["result"]["status"]["state"], "failed")
+        self.assertEqual(task["result"]["metadata"]["outcome"], "timeout")
+        card = Path(task["result"]["metadata"]["cardPath"])
+        self.assertTrue(card.is_file())
+        self.assertEqual(json.loads(card.read_text(encoding="utf-8"))["status"], "timeout")
+
 
 class CliLifecycleTests(unittest.TestCase):
     def setUp(self):
@@ -422,6 +536,86 @@ class CliLifecycleTests(unittest.TestCase):
         self.assertEqual(status, 200)
         return payload
 
+    def use_with_budget(self, workspace: str, task_timeout: int, lease_budget: int):
+        self.env["AGENT_A2A_TASK_TIMEOUT"] = str(task_timeout)
+        self.env["AGENT_A2A_LEASE_BUDGET"] = str(lease_budget)
+        try:
+            return self.use(workspace)
+        finally:
+            self.env.pop("AGENT_A2A_TASK_TIMEOUT", None)
+            self.env.pop("AGENT_A2A_LEASE_BUDGET", None)
+
+    def send_async(self, text: str):
+        started = time.monotonic()
+        result = self.run_cli("send", "--to", "trae", "--text", text)
+        elapsed = time.monotonic() - started
+        self.assertEqual(result.returncode, 0, result.stderr)
+        return json.loads(result.stdout), elapsed
+
+    def start_wait(self, task_id: str, timeout: int = 30):
+        return subprocess.Popen(
+            [sys.executable, "-B", str(self.app / "tools" / "agent_a2a.py"),
+             "wait", "--task-id", task_id, "--timeout", str(timeout)],
+            cwd=self.workspace_a, env=self.env, stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE, text=True, encoding="utf-8",
+        )
+
+    def test_async_dispatch_returns_task_id_then_one_terminal_notice(self):
+        self.use_with_budget(self.workspace_a, 20, 15)
+        dispatched, elapsed = self.send_async("async success")
+        self.assertLess(elapsed, 5)
+        self.assertEqual(dispatched["state"], "submitted")
+        self.assertTrue(dispatched["task_id"])
+        self.assertNotIn("text", dispatched)
+
+        waiter = self.start_wait(dispatched["task_id"])
+        task = wait_for(lambda: self.claim(self.workspace_a))
+        self.complete(task, "完成：async success")
+        stdout, stderr = waiter.communicate(timeout=30)
+        self.assertEqual(waiter.returncode, 0, stderr)
+        card = json.loads(stdout)
+        self.assertEqual(card["status"], "success")
+        self.assertEqual(card["state"], "completed")
+        self.assertTrue(card["event_id"].startswith(dispatched["task_id"] + ":success:"))
+        self.assertTrue(Path(card["card_path"]).is_file())
+
+        again = self.run_cli("wait", "--task-id", dispatched["task_id"], "--timeout", "10")
+        self.assertEqual(again.returncode, 0, again.stderr)
+        self.assertEqual(json.loads(again.stdout)["event_id"], card["event_id"])
+
+    def test_wait_delivers_partial_terminal_status(self):
+        self.use_with_budget(self.workspace_a, 20, 15)
+        dispatched, _ = self.send_async("async partial")
+        waiter = self.start_wait(dispatched["task_id"])
+        task = wait_for(lambda: self.claim(self.workspace_a))
+        status, _ = http_json(self.receiver, "/_relay/complete", method="POST",
+                              bearer=RELAY_TOKEN, body={
+            "taskId": task["taskId"], "leaseId": task["leaseId"],
+            "text": "部分完成，剩余项见结果卡", "status": "partial",
+        })
+        self.assertEqual(status, 200)
+        stdout, stderr = waiter.communicate(timeout=30)
+        self.assertEqual(waiter.returncode, 0, stderr)
+        card = json.loads(stdout)
+        self.assertEqual(card["status"], "partial")
+        payload = json.loads(Path(card["card_path"]).read_text(encoding="utf-8"))
+        self.assertEqual(payload["status"], "partial")
+        self.assertIn("剩余项", payload["summary"])
+
+    def test_wait_returns_timeout_terminal_status(self):
+        self.use_with_budget(self.workspace_a, 3, 3)
+        dispatched, _ = self.send_async("async timeout")
+        started = time.monotonic()
+        result = self.run_cli("wait", "--task-id", dispatched["task_id"], "--timeout", "15",
+                              timeout=30)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        card = json.loads(result.stdout)
+        self.assertEqual(card["status"], "timeout")
+        self.assertEqual(card["state"], "failed")
+        self.assertGreaterEqual(time.monotonic() - started, 2.5)
+        payload = json.loads(Path(card["card_path"]).read_text(encoding="utf-8"))
+        self.assertEqual(payload["status"], "timeout")
+
     def test_activation_environment_and_gemini_route(self):
         output = self.use(self.short_a)
         self.assertTrue(output["active"])
@@ -458,7 +652,7 @@ class CliLifecycleTests(unittest.TestCase):
         processes = [
             subprocess.Popen(
                 [sys.executable, "-B", str(self.app / "tools" / "agent_a2a.py"),
-                 "send", "--to", "trae", "--text", text, "--timeout", "30"],
+                 "send", "--to", "trae", "--text", text, "--timeout", "30", "--wait"],
                 cwd=self.workspace_a, env=self.env, stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE, text=True, encoding="utf-8",
             )

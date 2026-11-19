@@ -8,6 +8,7 @@ Agent Card 公开可读，A2A POST 使用本次激活随机生成的会话 beare
 from __future__ import annotations
 
 import argparse
+import hashlib
 import hmac
 import json
 import os
@@ -34,6 +35,9 @@ MAX_TEXT_LENGTH = 16_384
 MAX_TASKS = 128
 MAX_ACTIVE_TASKS = 4
 RETENTION_SECONDS = 600
+DEFAULT_TASK_TIMEOUT = 600
+DEFAULT_LEASE_BUDGET = 420
+SUMMARY_LIMIT = 160
 
 
 class RequestError(Exception):
@@ -123,12 +127,27 @@ class Task:
     timestamp: str = field(default_factory=lambda: datetime.now(timezone.utc).isoformat())
     terminal_at: float | None = None
     lease_id: str | None = None
+    claimed_at: float | None = None
     result: str | None = None
+    outcome: str | None = None
+    summary: str | None = None
+    card_path: str | None = None
+    event_id: str | None = None
 
-    def update(self, state: str, result: str | None = None) -> None:
+    def update(self, state: str, result: str | None = None, *,
+               outcome: str | None = None, summary: str | None = None,
+               card_path: str | None = None, event_id: str | None = None) -> None:
         self.state = state
         self.result = result
         self.timestamp = datetime.now(timezone.utc).isoformat()
+        if outcome is not None:
+            self.outcome = outcome
+        if summary is not None:
+            self.summary = summary
+        if card_path is not None:
+            self.card_path = card_path
+        if event_id is not None:
+            self.event_id = event_id
         if state in {"completed", "canceled", "failed"}:
             self.terminal_at = monotonic()
 
@@ -138,34 +157,104 @@ class Task:
             "status": {"state": self.state, "timestamp": self.timestamp},
         }
         if self.state == "completed":
+            text = self.result if self.result is not None else (self.summary or "")
             result["artifacts"] = [{
                 "artifactId": self.output_id, "name": "TRAE reply",
-                "parts": [text_part(self.result)],
+                "parts": [text_part(text)],
             }]
         elif self.state == "failed":
-            result["status"]["message"] = task_message(self, "agent", self.output_id, self.result)
+            result["status"]["message"] = task_message(
+                self, "agent", self.output_id, self.result or self.summary or "")
+        if self.terminal_at is not None:
+            result["metadata"] = {
+                "eventId": self.event_id,
+                "outcome": self.outcome,
+                "summary": self.summary,
+                "cardPath": self.card_path,
+            }
         if history_length:
             result["history"] = [task_message(self, "user", self.message_id, self.prompt)]
         return result
 
 
 class RelayQueue:
-    def __init__(self, task_timeout: int, wait_timeout: int, workspace: str):
+    def __init__(self, task_timeout: int, wait_timeout: int, workspace: str, *,
+                 lease_budget: int | None = None, results_dir: Path | None = None,
+                 log_path: Path | None = None):
         self.task_timeout = task_timeout
         self.wait_timeout = wait_timeout
         self.workspace = workspace
+        self.lease_budget = min(lease_budget or DEFAULT_LEASE_BUDGET, task_timeout)
+        self.results_dir = results_dir
+        self.log_path = log_path
         self.tasks: dict[str, Task] = {}
         self.changed = threading.Condition()
         self.stopping = False
 
+    @staticmethod
+    def _summary(text: str | None, fallback: str) -> str:
+        for line in (text or "").splitlines():
+            if line.strip():
+                return line.strip()[:SUMMARY_LIMIT]
+        return fallback[:SUMMARY_LIMIT]
+
+    def _log(self, message: str) -> None:
+        if self.log_path is None:
+            return
+        try:
+            with open(self.log_path, "a", encoding="utf-8") as handle:
+                handle.write(f"{datetime.now(timezone.utc).isoformat()} {message}\n")
+        except OSError:
+            pass
+
+    def _write_card(self, task: Task, outcome: str, text: str, summary: str) -> str | None:
+        if self.results_dir is None:
+            return None
+        payload = {
+            "schema": "trae.a2a.result_card.v2.1",
+            "taskId": task.id,
+            "contextId": task.context_id,
+            "workspace": self.workspace,
+            "status": outcome,
+            "summary": summary,
+            "text": text,
+            "createdAt": datetime.now(timezone.utc).isoformat(),
+        }
+        try:
+            self.results_dir.mkdir(parents=True, exist_ok=True)
+            path = self.results_dir / f"{task.id}.json"
+            temporary = path.with_suffix(".json.tmp")
+            temporary.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+            os.replace(temporary, path)
+        except OSError as error:
+            self._log(f"card write failed task={task.id}: {type(error).__name__}")
+            return None
+        return str(path)
+
+    def _terminal(self, task: Task, state: str, text: str, outcome: str,
+                  summary: str) -> None:
+        digest = hashlib.sha256((text or "").encode("utf-8", "replace")).hexdigest()[:16]
+        event_id = f"{task.id}:{outcome}:{digest}"
+        card_path = self._write_card(task, outcome, text or "", summary)
+        task.update(state, text, outcome=outcome, summary=summary,
+                    card_path=card_path, event_id=event_id)
+        self._log(f"terminal task={task.id} state={state} outcome={outcome} event={event_id}")
+        self.changed.notify_all()
+
     def expire(self) -> None:
         now = monotonic()
         for task in list(self.tasks.values()):
-            if task.terminal_at is None and task.deadline <= now:
-                task.update("failed", "The TRAE desktop session did not complete the task before its deadline")
-                self.changed.notify_all()
-            elif task.terminal_at is not None and now - task.terminal_at >= RETENTION_SECONDS:
-                del self.tasks[task.id]
+            if task.terminal_at is not None:
+                if now - task.terminal_at >= RETENTION_SECONDS:
+                    del self.tasks[task.id]
+                continue
+            if task.deadline <= now:
+                self._terminal(task, "failed", "", "timeout",
+                               "Task deadline reached before a result was returned")
+            elif (task.state == "working" and task.claimed_at is not None
+                  and task.claimed_at + self.lease_budget <= now):
+                self._terminal(task, "completed", "", "partial",
+                               "Lease budget exhausted before the worker returned a result")
 
     def counts(self) -> tuple[int, int]:
         queued = sum(task.state == "submitted" for task in self.tasks.values())
@@ -209,6 +298,7 @@ class RelayQueue:
                 task = Task(message_id, prompt, monotonic() + self.task_timeout,
                             context_id=context_id or str(uuid4()))
                 self.tasks[task.id] = task
+                self._log(f"queued task={task.id}")
             elif task.prompt != prompt or (context_id and task.context_id != context_id):
                 raise RequestError(-32602, "messageId already belongs to a different message")
 
@@ -242,8 +332,7 @@ class RelayQueue:
             task = self.get_task(params.get("id"))
             if task.state != "submitted":
                 raise RequestError(-32002, "Only tasks awaiting desktop submission can be canceled")
-            task.update("canceled")
-            self.changed.notify_all()
+            self._terminal(task, "canceled", "", "failed", "Task canceled before a desktop claim")
             return task.snapshot()
 
     def claim(self, workspace: str | None = None) -> dict:
@@ -257,24 +346,37 @@ class RelayQueue:
             if task is None:
                 return {}
             task.lease_id = str(uuid4())
+            task.claimed_at = monotonic()
             task.update("working")
+            self._log(f"claimed task={task.id} lease_budget={self.lease_budget}")
             self.changed.notify_all()
             return {"taskId": task.id, "leaseId": task.lease_id, "text": task.prompt,
-                    "workspace": self.workspace}
+                    "workspace": self.workspace, "leaseBudgetSeconds": self.lease_budget}
 
     def finish(self, params: dict, state: str) -> dict:
         reply = text_value(params.get("text"), "reply")
         lease_id = text_value(params.get("leaseId"), "leaseId", 128)
+        requested = params.get("status", "done" if state == "completed" else "failed")
+        if requested not in {"done", "partial", "failed"}:
+            raise RequestError(-32602, "status must be done, partial, or failed")
+        if state == "failed" or requested == "failed":
+            target_state, outcome = "failed", "failed"
+        elif requested == "partial":
+            target_state, outcome = "completed", "partial"
+        else:
+            target_state, outcome = "completed", "success"
         with self.changed:
             task = self.get_task(params.get("taskId"))
             if task.lease_id is None or not lease_id.isascii() or not hmac.compare_digest(task.lease_id, lease_id):
                 raise RequestError(-32602, "The lease does not match this task")
-            if task.state == state and task.result == reply:
+            if (task.terminal_at is not None and task.state == target_state
+                    and task.result == reply and task.outcome == outcome):
                 return {}
             if task.state != "working":
                 raise RequestError(-32004, "The desktop relay can only finish a claimed task")
-            task.update(state, reply)
-            self.changed.notify_all()
+            fallback = {"success": "Task completed.", "partial": "Partial result returned.",
+                        "failed": "Task failed."}[outcome]
+            self._terminal(task, target_state, reply, outcome, self._summary(reply, fallback))
             return {}
 
 
@@ -386,7 +488,7 @@ def agent_card(url: str) -> dict:
         "description": "Delegates standalone text tasks to the TRAE desktop session bound to one local workspace.",
         "url": url,
         "preferredTransport": "JSONRPC",
-        "version": "1.0.0",
+        "version": "2.1.0",
         "capabilities": {"streaming": True, "pushNotifications": False},
         "defaultInputModes": ["text/plain"],
         "defaultOutputModes": ["text/plain"],
@@ -525,7 +627,10 @@ class Handler(BaseHTTPRequestHandler):
             with queue.changed:
                 snapshot = task.snapshot()
             identity = {"taskId": task.id, "contextId": task.context_id}
-            event({key: snapshot[key] for key in ("kind", "id", "contextId", "status")})
+            initial = {key: snapshot[key] for key in ("kind", "id", "contextId", "status")}
+            if snapshot.get("metadata"):
+                initial["metadata"] = snapshot["metadata"]
+            event(initial)
             last_state = snapshot["status"]["state"]
             while True:
                 with queue.changed:
@@ -540,7 +645,10 @@ class Handler(BaseHTTPRequestHandler):
                     event({"kind": "artifact-update", **identity, "artifact": artifact,
                            "append": False, "lastChunk": True})
                 if final or status["state"] != last_state:
-                    event({"kind": "status-update", **identity, "status": status, "final": final})
+                    update = {"kind": "status-update", **identity, "status": status, "final": final}
+                    if snapshot.get("metadata"):
+                        update["metadata"] = snapshot["metadata"]
+                    event(update)
                     if final:
                         return
                     last_state = status["state"]
@@ -585,6 +693,8 @@ class Handler(BaseHTTPRequestHandler):
             "sessionToken": self.server.session_token,
             "startedAt": self.server.started_at,
             "tasks": {"queued": queued, "working": working, "total": len(self.server.queue.tasks)},
+            "taskTimeout": self.server.queue.task_timeout,
+            "leaseBudget": self.server.queue.lease_budget,
             "gemini": self.server.gemini.status() if self.server.gemini else {"state": "disabled"},
         })
 
@@ -613,7 +723,8 @@ def main() -> int:
     parser.add_argument("--workspace", required=True, help="Absolute active workspace")
     parser.add_argument("--port", type=int, default=DEFAULT_PORT)
     parser.add_argument("--gemini-port", type=int, default=DEFAULT_GEMINI_PORT)
-    parser.add_argument("--task-timeout", type=int, default=600)
+    parser.add_argument("--task-timeout", type=int, default=DEFAULT_TASK_TIMEOUT)
+    parser.add_argument("--lease-budget", type=int, default=DEFAULT_LEASE_BUDGET)
     parser.add_argument("--wait-timeout", type=int, default=90)
     args = parser.parse_args()
 
@@ -622,8 +733,9 @@ def main() -> int:
         parser.error("--workspace must be an existing absolute directory")
     if not 0 <= args.port <= 65_535 or not 0 < args.gemini_port <= 65_535:
         parser.error("Choose valid ports")
-    if not 0 < args.wait_timeout <= args.task_timeout:
-        parser.error("Choose a valid wait timeout no longer than the task timeout")
+    args.wait_timeout = max(1, min(args.wait_timeout, args.task_timeout))
+    if not 0 < args.lease_budget <= args.task_timeout:
+        parser.error("Choose a lease budget no longer than the task timeout")
 
     try:
         relay_token = read_relay_token()
@@ -644,7 +756,10 @@ def main() -> int:
     except OSError:
         pass
 
-    queue = RelayQueue(args.task_timeout, args.wait_timeout, workspace)
+    queue = RelayQueue(
+        args.task_timeout, args.wait_timeout, workspace,
+        lease_budget=args.lease_budget, results_dir=home_dir() / "results", log_path=log_path,
+    )
     try:
         server = Gateway(args.port, queue, relay_token, session_token, workspace, args.gemini_port)
     except OSError as error:
