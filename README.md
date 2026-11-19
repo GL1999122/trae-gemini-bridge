@@ -60,9 +60,9 @@ a2a gemini
 
 1. 在 TRAE 打开与 `a2a use` 相同的项目，选择 `/trae-gemini-bridge`。可以让它调用 Gemini，也可以开始领取待办任务。
 2. 若需要从 Gemini 派单，在该项目终端运行 `a2a gemini`，指示它调用 `trae-bridge` 子代理。包装命令运行原生 Gemini CLI，并为本次工作区连接设置凭证。
-3. 在 TRAE 领取并执行任务。结果以 A2A 任务状态和结果文本回到发送方。
+3. 在 TRAE 领取并执行任务。回传后由网关生成唯一的终态结果卡；发送方用 `a2a wait` 收到一条可去重的终态通知，再按 `card_path` 验收一次。
 
-一台本机桥接服务同时绑定一个活动工作区。切换项目会启动针对新目录的官方 Gemini 服务。TRAE 领取时校验工作区，旧 Gemini 会话的凭证在切换后失效。TRAE 由桌面会话主动领取，队列只保存在本机进程内。 Gemini CLI 会通过 A2A 流等待桌面回执，单个待办有效期为 10 分钟。如果长时间闲置的 Gemini 会话提示上下文已过期，重新运行 `a2a gemini` 可建立新会话。
+一台本机桥接服务同时绑定一个活动工作区。切换项目会启动针对新目录的官方 Gemini 服务。TRAE 领取时校验工作区，旧 Gemini 会话的凭证在切换后失效。TRAE 由桌面会话主动领取，队列只保存在本机进程内。任务默认硬截止 600 秒、领取后执行预算 420 秒：超预算由网关按 `partial` 收口，未领取按 `timeout` 收口。Gemini CLI 通过 A2A 流等待桌面回执；Orca / Codex 用一次 `a2a wait` 等待终态通知。如果长时间闲置的 Gemini 会话提示上下文已过期，重新运行 `a2a gemini` 可建立新会话。
 
 ## V2.1 异步派单与终态通知
 
@@ -78,17 +78,27 @@ a2a gemini
 
 可通过 `AGENT_A2A_TASK_TIMEOUT` 和 `AGENT_A2A_LEASE_BUDGET` 调整硬截止时间与执行预算（默认 600 / 420 秒），测试或演示时可缩短。
 
+兼容与迁移：
+
+- 旧脚本若依赖一步式阻塞派单，在 `a2a send --to trae` 后加 `--wait`，或拆成 `send` + `wait` 两步。
+- MCP `complete_trae_task` 新增 `status`（`done` / `partial` / `failed`，默认 `done`）；`failed: true` 仍等价于 `status: failed`。
+- `a2a status` 只用于查看活动工作区和服务状态，不要用它轮询任务终态。
+
 ## 常见问题
 
 - **TRAE 里找不到 `/trae-gemini-bridge` 或 MCP 工具**：已有 TRAE 窗口需要重载才能读取安装器写入的 Skill 和 MCP；并在 TRAE 设置的全局 MCP 列表确认 `agent-a2a-bridge` 已启用。
 - **Orca 终端里 `a2a` 不是可识别的命令**：已打开的终端不会继承新的用户 PATH，使用 `%LOCALAPPDATA%\AgentA2A\bin\a2a.cmd` 的绝对路径，或新开终端。
 - **`gemini_a2a_send` 提示配额不可用**：默认模型配额耗尽时，安装时通过 `-GeminiModel` 指定自己有权使用的 Gemini 模型。
+- **`a2a wait` 返回 `timeout`**：任务在硬截止时间前无人领取。确认 TRAE 窗口已打开同一项目，并完成 `claim_trae_task`。
+- **`a2a wait` 返回 `partial`**：TRAE 明确以 partial 回传，或领取后超过 420 秒执行预算未回传。按通知里的 `card_path` 查看已完成项与剩余项，未完成部分另开任务。
+- **收到重复的终态通知**：按 `event_id` 去重。同一任务重复 `wait` 或重连只会返回同一个 `event_id`，不会生成新事件。
+- **找不到结果卡**：默认路径为 `%LOCALAPPDATA%\AgentA2A\results\<taskId>.json`；写入失败时通知中的 `card_path` 为空，但 `text` 仍包含结果。
 - **Gemini 会话提示上下文已过期**：长时间闲置后凭证会失效，重新运行 `a2a gemini` 建立新会话。
 - **切换项目后旧任务无法领取**：一台本机桥接服务同时只绑定一个活动工作区，切换后旧 Gemini 会话的凭证自动失效，属预期行为。
 
 ## 验证
 
-安装依赖后，在仓库根目录运行回归测试。
+安装依赖后，在仓库根目录运行回归测试。当前套件包含 21 项测试，覆盖 success、partial、timeout、租约收口、重连去重与 MCP 参数校验。
 
 ```powershell
 python -B -m unittest discover -s tests -v
