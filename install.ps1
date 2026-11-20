@@ -119,6 +119,38 @@ function Update-ManagedFile([string]$Source, [string]$Destination, [switch]$Allo
     }
 }
 
+function Test-SkillPathLink([string]$Path) {
+    for ($entry = [IO.Path]::GetFullPath($Path); $entry; $entry = [IO.Path]::GetDirectoryName($entry)) {
+        $item = Get-Item -LiteralPath $entry -Force -ErrorAction SilentlyContinue
+        if ($null -ne $item -and ($item.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) {
+            return $true
+        }
+    }
+    return $false
+}
+
+function Update-OrcaSkill([switch]$Write) {
+    if (Test-SkillPathLink $orcaSkillTarget) {
+        throw "Refusing to install the Orca/Codex skill through a link: $orcaSkillTarget"
+    }
+    Update-ManagedFile $orcaSkillSource $orcaSkillTarget -AllowMarker -Write:$Write
+    if (!$Write) {
+        return
+    }
+
+    $legacySkill = Join-Path $OrcaSkillsDir 'agent-a2a\SKILL.md'
+    if (Test-SkillPathLink $legacySkill) {
+        Write-Warning "Leaving the linked legacy Orca/Codex skill unchanged: $legacySkill"
+        return
+    }
+    if ([IO.File]::Exists($legacySkill)) {
+        $legacyText = [IO.File]::ReadAllText($legacySkill)
+        if ($legacyText.Contains($skillMarker) -and $legacyText -cmatch '(?m)^name:[ \t]*agent-a2a[ \t]*\r?$') {
+            [IO.File]::Delete($legacySkill)
+        }
+    }
+}
+
 function Add-PathEntry([string]$Current, [string]$Directory) {
     $windowsSeparator = [char]92
     $entry = $Directory.TrimEnd($windowsSeparator)
@@ -161,8 +193,8 @@ if ($LASTEXITCODE -ne 0) {
 
 $traeSkillSource = Join-Path $PSScriptRoot 'skills\trae-gemini-bridge\SKILL.md'
 $traeSkillTarget = Join-Path $TraeSkillsDir 'trae-gemini-bridge\SKILL.md'
-$orcaSkillSource = Join-Path $PSScriptRoot 'skills\agent-a2a\SKILL.md'
-$orcaSkillTarget = Join-Path $OrcaSkillsDir 'agent-a2a\SKILL.md'
+$orcaSkillSource = Join-Path $PSScriptRoot 'skills\agent-a2a-v21\SKILL.md'
+$orcaSkillTarget = Join-Path $OrcaSkillsDir 'agent-a2a-v21\SKILL.md'
 $geminiAgentSource = Join-Path $PSScriptRoot 'gemini\agents\trae-bridge.md'
 $geminiHome = if ($env:GEMINI_CLI_HOME) { $env:GEMINI_CLI_HOME } else { $env:USERPROFILE }
 $geminiAgentTarget = Join-Path $geminiHome '.gemini\agents\trae-bridge.md'
@@ -194,7 +226,7 @@ $installLock = [IO.File]::Open((Join-Path $installDir 'install.lock'), 'OpenOrCr
 try {
     Update-TraeConfig
     Update-ManagedFile $traeSkillSource $traeSkillTarget -AllowMarker
-    Update-ManagedFile $orcaSkillSource $orcaSkillTarget -AllowMarker
+    Update-OrcaSkill
     Update-ManagedFile $geminiAgentSource $geminiAgentTarget
 
     if ((Test-Path -LiteralPath $appDir) -and !(Test-Path -LiteralPath $appMarker -PathType Leaf)) {
@@ -285,8 +317,8 @@ exit /b %errorlevel%
 
     Update-TraeConfig -Write
     Update-ManagedFile $traeSkillSource $traeSkillTarget -AllowMarker -Write
-    Update-ManagedFile $orcaSkillSource $orcaSkillTarget -AllowMarker -Write
     Update-ManagedFile $geminiAgentSource $geminiAgentTarget -Write
+    Update-OrcaSkill -Write
 
     if (!$NoPath) {
         $current = [Environment]::GetEnvironmentVariable('Path', 'User')
@@ -307,4 +339,4 @@ exit /b %errorlevel%
 Write-Host "Installed: $(Join-Path $binDir 'a2a.cmd')"
 Write-Host "TRAE: $serverName MCP and /trae-gemini-bridge"
 Write-Host "Gemini: trae-bridge remote subagent"
-Write-Host "Orca/Codex: agent-a2a skill"
+Write-Host "Orca/Codex: agent-a2a-v21 skill"

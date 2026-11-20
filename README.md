@@ -33,7 +33,7 @@ powershell -ExecutionPolicy Bypass -File .\install.ps1
 powershell -ExecutionPolicy Bypass -File .\install.ps1 -GeminiModel gemini-3.5-flash-lite
 ```
 
-安装器将程序和随机生成的本机令牌放在 `%LOCALAPPDATA%\AgentA2A`，并挂载 TRAE 用户级 MCP 和 Skill、Gemini 用户级 `trae-bridge` 远程代理及 Orca/Codex 用户级 `agent-a2a` Skill。已有 TRAE 窗口可重载以读取更新。在 TRAE 设置的全局 MCP 列表确认 `agent-a2a-bridge` 已启用。
+安装器将程序和随机生成的本机令牌放在 `%LOCALAPPDATA%\AgentA2A`，并挂载 TRAE 用户级 MCP 和 Skill、Gemini 用户级 `trae-bridge` 远程代理及 Orca/Codex 用户级 `agent-a2a-v21` Skill。升级时先安装新技能，再移除安装器管理的旧 `agent-a2a` 技能文件。用户自行维护的技能内容和目录内的其他文件会保留。已有 TRAE 窗口可重载以读取更新。在 TRAE 设置的全局 MCP 列表确认 `agent-a2a-bridge` 已启用。
 
 ## 从 Orca 为当前项目使用
 
@@ -48,7 +48,7 @@ a2a wait --task-id <上一步返回的 task_id> --timeout 620
 a2a gemini
 ```
 
-向 TRAE 派单默认只返回 `task_id`，随后用一次 `a2a wait` 收到终态通知；不要再轮询 `status` 或重复 `send`。需要旧的一步式阻塞行为时加 `--wait`。
+在 Orca / Codex 中可通过 `$agent-a2a-v21` 调用。向 TRAE 派单立即返回 `task_id`，随后用一次 `a2a wait` 收到终态通知。等待期间由网关跟踪状态。
 
 ```powershell
 & "$env:LOCALAPPDATA\AgentA2A\bin\a2a.cmd" use
@@ -62,7 +62,22 @@ a2a gemini
 2. 若需要从 Gemini 派单，在该项目终端运行 `a2a gemini`，指示它调用 `trae-bridge` 子代理。包装命令运行原生 Gemini CLI，并为本次工作区连接设置凭证。
 3. 在 TRAE 领取并执行任务。回传后由网关生成唯一的终态结果卡；发送方用 `a2a wait` 收到一条可去重的终态通知，再按 `card_path` 验收一次。
 
-一台本机桥接服务同时绑定一个活动工作区。切换项目会启动针对新目录的官方 Gemini 服务。TRAE 领取时校验工作区，旧 Gemini 会话的凭证在切换后失效。TRAE 由桌面会话主动领取，队列只保存在本机进程内。任务默认硬截止 600 秒、领取后执行预算 420 秒：超预算由网关按 `partial` 收口，未领取按 `timeout` 收口。Gemini CLI 通过 A2A 流等待桌面回执；Orca / Codex 用一次 `a2a wait` 等待终态通知。如果长时间闲置的 Gemini 会话提示上下文已过期，重新运行 `a2a gemini` 可建立新会话。
+一台本机桥接服务同时绑定一个活动工作区。切换项目会启动针对新目录的官方 Gemini 服务。TRAE 领取时校验工作区，旧 Gemini 会话的凭证在切换后失效。TRAE 会话通过 V2.1 MCP 主动领取，队列只保存在本机进程内。任务默认硬截止 600 秒、领取后执行预算 420 秒：超预算由网关按 `partial` 收口，未领取按 `timeout` 收口。Gemini CLI 通过 A2A 流等待桌面回执；Orca / Codex 用一次 `a2a wait` 等待终态通知。如果长时间闲置的 Gemini 会话提示上下文已过期，重新运行 `a2a gemini` 可建立新会话。
+
+### 用 TRAE CLI 启动独立工作会话
+
+已安装并登录 TRAE CLI 时，可给一次 `exec` 会话临时挂载 V2.1 MCP。先运行 `trae-cli login status`，从与 `a2a use` 一致的项目根目录启动。下面的挂载只作用于本次会话。
+
+```powershell
+$python = (Get-Command python.exe).Source.Replace([char]92, [char]47)
+$adapter = (Join-Path $env:LOCALAPPDATA 'AgentA2A\app\tools\trae_gemini_mcp.py').Replace([char]92, [char]47)
+$mcpCommand = "mcp_servers.a2a_v21.command='$python'"
+$mcpArgs = "mcp_servers.a2a_v21.args=['-B','$adapter','--managed']"
+$workspace = (Get-Location).Path
+trae-cli -c $mcpCommand -c $mcpArgs exec "用 a2a_v21 MCP 在 $workspace 领取任务。按工单完成后用原 taskId 和 leaseId 回传一次。"
+```
+
+CLI 和桌面版是分别登录的。CLI 如果在启动时返回认证错误，本次会话尚未领取任务。桌面用户也可在同一项目下开新对话，通过 `/trae-gemini-bridge` 领取。派单任务在领取前由网关保留至截止时间。
 
 ## V2.1 异步派单与终态通知
 
@@ -89,7 +104,7 @@ a2a gemini
 - **TRAE 里找不到 `/trae-gemini-bridge` 或 MCP 工具**：已有 TRAE 窗口需要重载才能读取安装器写入的 Skill 和 MCP；并在 TRAE 设置的全局 MCP 列表确认 `agent-a2a-bridge` 已启用。
 - **Orca 终端里 `a2a` 不是可识别的命令**：已打开的终端不会继承新的用户 PATH，使用 `%LOCALAPPDATA%\AgentA2A\bin\a2a.cmd` 的绝对路径，或新开终端。
 - **`gemini_a2a_send` 提示配额不可用**：默认模型配额耗尽时，安装时通过 `-GeminiModel` 指定自己有权使用的 Gemini 模型。
-- **`a2a wait` 返回 `timeout`**：任务在硬截止时间前无人领取。确认 TRAE 窗口已打开同一项目，并完成 `claim_trae_task`。
+- **`a2a wait` 返回 `timeout`**：任务在硬截止时间前无人领取。确认 TRAE 工作会话绑定同一项目并已调用 `claim_trae_task`。
 - **`a2a wait` 返回 `partial`**：TRAE 明确以 partial 回传，或领取后超过 420 秒执行预算未回传。按通知里的 `card_path` 查看已完成项与剩余项，未完成部分另开任务。
 - **收到重复的终态通知**：按 `event_id` 去重。同一任务重复 `wait` 或重连只会返回同一个 `event_id`，不会生成新事件。
 - **找不到结果卡**：默认路径为 `%LOCALAPPDATA%\AgentA2A\results\<taskId>.json`；写入失败时通知中的 `card_path` 为空，但 `text` 仍包含结果。
